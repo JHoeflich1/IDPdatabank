@@ -9,6 +9,7 @@ import socket
 import urllib.error
 from tqdm import tqdm
 import urllib.request
+import json
 
 import logging
 logger = logging.getLogger(__name__)
@@ -145,6 +146,60 @@ def resolve_download_file_url(
                 else:
                     raise hte
         return uri
+    elif "10.17617" in doi:
+        uri = "https://edmond.mpg.de/api/datasets/:persistentId/?persistentId=doi:" + doi
+
+        # did not see a direct way with the api to grab an individual file, so look through metadata to find fileid from name
+        try:
+            with urllib.request.urlopen(uri) as response:
+                dataset_metadata = json.loads(response.read().decode())
+                # Save metadata to file as a check 
+                # with open("edmond_metadata.json", "w", encoding="utf-8") as out_file:
+                #     json.dump(dataset_metadata, out_file, indent=2)
+        
+        except Exception as e:
+            raise RuntimeError(f"Could not fetch metadata from Edmond: {e}")
+
+        try: # try to look for file by supplied file nsma 
+            files = dataset_metadata['data']['latestVersion']['files']
+            # print("files:", files)
+            file_id = None
+            for f in files:
+                if f['dataFile']['filename'] == fi_name:
+                    file_id = f['dataFile']['id']
+                    # print("file_id:\n", file_id)
+                    break
+        except KeyError as e:
+            raise RuntimeError(f"Unexpected metadata structure: {e}")
+        
+        if not file_id:
+            raise FileNotFoundError(f"File '{fi_name}' not found in dataset {doi}")
+        
+        # new uri for the file
+        uri = f"https://edmond.mpg.de/api/access/datafile/{file_id}"
+
+        # check if ressource exists, may throw exception (copied from above, can likely condense)
+        if validate_uri:
+            try:
+                socket.setdefaulttimeout(10)  # seconds
+                _ = urllib.request.urlopen(uri, timeout=10)
+            except TimeoutError:
+                raise RuntimeError(f"Cannot open {uri}. Timeout error.")
+            except urllib.error.HTTPError as hte:
+                if hte.code == 429:
+                    if sleep429/5 > 10:
+                        raise TimeoutError(
+                            "Too many iteration of increasing waiting time!")
+                    logger.warning(f"HTTP error returned from URI: {uri}")
+                    logger.warning(f"Site returns 429 code."
+                                   f" Try to sleep {sleep429} seconds and repeat!")
+                    time.sleep(sleep429)
+                    return resolve_download_file_url(doi, fi_name, validate_uri,
+                                                     sleep429=sleep429+5)
+                else:
+                    raise hte
+        return uri
+
     else:
         raise NotImplementedError(
             "Repository not validated. Please upload the data for example to zenodo.org"
