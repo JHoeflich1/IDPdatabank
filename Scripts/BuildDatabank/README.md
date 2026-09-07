@@ -260,3 +260,18 @@ For the simulations, we are calculating the concentration of each ion (eg. Na⁺
 For the experiments, we only have the concentration of the salt (eg. CaCl₂). For dealing with this, we are using the stoichiometry of the salt to calculate the concentration of each ion (eg. Ca²⁺, 2 x Cl⁻). 
 
 The stoichiometry of the salt is defined in the buffer_molecule_data.py file.
+
+## Downloading zipped simulation files
+
+AddData accepts files from Zenodo and public Dataverse repositories. 
+Specify the outer archive followed by the exact member path. For example,
+
+```yaml
+DOI: 10.5281/zenodo.RECORD_NUMBER
+TRJ: trajectories.zip/replica1/run.xtc
+TPR: trajectories.zip/replica1/run.tpr
+```
+Nested archives use the same
+syntax, such as `outer.zip/folder/inner.tar.gz/run.xtc`. ZIP, TAR, TAR.GZ, TGZ and 7z
+are recognized. A repository file that is not inside an archive
+is specified normally, such as `run.xtc`.

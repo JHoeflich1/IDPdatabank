@@ -600,8 +600,16 @@ def parse_valid_config_settings(info_yaml: dict) -> tuple[dict, list[str]]:
                     logger.debug(f"entry '{key_sim}' has NoneType value, skipping")
                 # already a list -> ok
                 elif isinstance(value_sim, list):
-                    logger.debug(f"value_sim '{value_sim}' is already a list, skipping")
-                    files_tbd.extend(value_sim)
+                    entries = []
+                    for entry in value_sim:
+                        if isinstance(entry, str):
+                            entry = [entry]
+                        if (not isinstance(entry, list) or not entry
+                                or not isinstance(entry[0], str) or not entry[0].strip()):
+                            raise YamlBadConfigException(f"Invalid file entry in {key_sim}: {entry!r}")
+                        entries.append(entry)
+                    sim[key_sim] = entries
+                    files_tbd.extend(entry[0] for entry in entries)
                 else:
                     value_sim_splitted = value_sim.split(";")
 
