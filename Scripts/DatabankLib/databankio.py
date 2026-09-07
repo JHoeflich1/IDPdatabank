@@ -92,7 +92,11 @@ def _download(uri, destination, override=False):
     with urllib.request.urlopen(uri, timeout=10) as response:
         length = response.headers.get("Content-Length")
         expected = int(length) if length is not None else None
-        if existed and not override and expected is not None and destination.stat().st_size == expected:
+        already_complete = (
+            existed and not override and expected is not None
+            and destination.stat().st_size == expected
+        )
+        if already_complete:
             return 1
 
         def blocks():
@@ -149,7 +153,8 @@ def download_resource_from_uri(uri, dest, override_if_exists=False, *, source_pa
 
 
 def prepare_file_sources(sim, file_keys):
-    """Normalize file fields; return source paths for this import only."""
+    """Normalize file fields to local basenames; record archive locations in
+    SOURCE_FILES so the file can be resolved again after DIR_WRK is gone."""
     seen = {}
     replacements = []
     for key in file_keys:
@@ -158,23 +163,34 @@ def prepare_file_sources(sim, file_keys):
             source = str(validate_source_path(original))
             local = validate_source_path(original).name
             if local in seen and seen[local] != source:
-                raise ValueError(f"Files {seen[local]!r} and {source!r} share local filename {local!r}")
+                raise ValueError(
+                    f"Files {seen[local]!r} and {source!r} share local filename {local!r}"
+                )
             seen[local] = source
             replacements.append((entry, local))
     for entry, local in replacements:
         entry[0] = local
+    archived = {local: source for local, source in seen.items() if source != local}
+    if archived:
+        sim["SOURCE_FILES"] = archived
     return seen
+
+
+def download_system_file(system, local_name, dest, override_if_exists=False):
+    """Download one system file, e.g. for re-download at analysis time, resolving
+    it via SOURCE_FILES if it originally came from inside an archive. Falls back
+    to local_name itself as the repository filename otherwise."""
+    source = (system.get("SOURCE_FILES") or {}).get(local_name, local_name)
+    uri = resolve_download_file_url(system["DOI"], source)
+    return download_resource_from_uri(uri, dest, override_if_exists, source_path=source)
 
 
 def download_simulation_files(sim, destination, file_keys, override_if_exists=False):
     """AddData's download stage: normalize metadata and materialize local files."""
     sources = prepare_file_sources(sim, file_keys)
-    for local, source in sources.items():
-        logger.info("Downloading %s from %s", local, source)
-        uri = resolve_download_file_url(sim["DOI"], source)
-        download_resource_from_uri(
-            uri, Path(destination) / local, override_if_exists, source_path=source
-        )
+    for local in sources:
+        logger.info("Downloading %s from %s", local, sources[local])
+        download_system_file(sim, local, Path(destination) / local, override_if_exists)
     return list(sources)
 
 
@@ -231,7 +247,6 @@ def resolve_download_file_url(
     """
 
     archive_name = fi_name.split('/')[0]
-
 
     if "zenodo" in doi.lower():
         zenodo_entry_number = doi.split(".")[2]

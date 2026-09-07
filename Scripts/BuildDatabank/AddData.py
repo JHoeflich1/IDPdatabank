@@ -242,7 +242,7 @@ if __name__ == "__main__":
         try:
             entry_type = software_sim[key_sim]["TYPE"]
         except KeyError:
-            if key_sim in ["SOFTWARE", "ID"]:
+            if key_sim in ["SOFTWARE", "ID", "SOURCE_FILES"]:
                 continue
             else:
                 # That shouldn't happen! Unexpected YAML-keys were checked by
