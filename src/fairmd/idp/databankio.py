@@ -12,7 +12,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote, urlencode
 
 import libarchive
 from tqdm import tqdm
@@ -86,10 +86,66 @@ def extract_nested_file_from_archives(archive_path, nested_path, dest_path):
             depth += 1
 
 
+_dryad_token_cache = {"token": None, "expires_at": 0.0}
+
+
+def _dryad_token():
+    """Get a bearer token for Dryad's API, if credentials are configured.
+
+    Dryad requires a bearer token to fetch file bytes even for public
+    datasets (metadata/listing endpoints are open). Two ways to provide one:
+    - DRYAD_API_TOKEN: a token you already obtained (valid ~10 hours).
+    - DRYAD_CLIENT_ID / DRYAD_CLIENT_SECRET: an API account's credentials
+      (see https://datadryad.org/account); a token is fetched via OAuth2
+      client_credentials and cached in-process until it expires.
+    """
+    token = os.environ.get("DRYAD_API_TOKEN")
+    if token:
+        return token
+
+    client_id = os.environ.get("DRYAD_CLIENT_ID")
+    client_secret = os.environ.get("DRYAD_CLIENT_SECRET")
+    if not (client_id and client_secret):
+        return None
+
+    if _dryad_token_cache["token"] and time.time() < _dryad_token_cache["expires_at"]:
+        return _dryad_token_cache["token"]
+
+    data = urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "client_credentials",
+    }).encode()
+    request = urllib.request.Request(
+        f"{DRYAD_HOST}/oauth/token", data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode())
+    except Exception as e:
+        raise RuntimeError(f"Could not obtain Dryad API token: {e}")
+
+    _dryad_token_cache["token"] = payload["access_token"]
+    # Renew a bit early to avoid racing the actual expiry.
+    _dryad_token_cache["expires_at"] = time.time() + payload.get("expires_in", 36000) - 60
+    return _dryad_token_cache["token"]
+
+
+def _auth_headers(uri):
+    """Attach a bearer token to Dryad file-download requests, if configured."""
+    if urlparse(uri).netloc == "datadryad.org":
+        token = _dryad_token()
+        if token:
+            return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
 def _download(uri, destination, override=False):
     destination = Path(destination)
     existed = destination.is_file()
-    with urllib.request.urlopen(uri, timeout=10) as response:
+    request = urllib.request.Request(uri, headers=_auth_headers(uri))
+    with urllib.request.urlopen(request, timeout=10) as response:
         length = response.headers.get("Content-Length")
         expected = int(length) if length is not None else None
         already_complete = (
@@ -225,13 +281,14 @@ def resolve_download_file_url(
     Steps:
     0) If doi is an "mddb:<project>" reference (MDDB/MDposit has no DOIs),
        resolve it separately -- see resolve_mddb_file_url.
-    1) Resolve DOI via https://doi.org to get final domain.
-    2) Check if domain is a Dataverse by querying /api/info/version.
-    3) If Dataverse:
+    1) If Zenodo, construct direct Zenodo file URL.
+    2) If Dryad, resolve via the Dryad API -- see resolve_dryad_file_url.
+    3) Resolve DOI via https://doi.org to get final domain.
+    4) Check if domain is a Dataverse by querying /api/info/version.
+    5) If Dataverse:
        - Try direct file DOI access
        - If fails, query dataset metadata to find file by name.
-    4) If Zenodo, construct direct Zenodo file URL.
-    5) Validate final URL if requested.
+    6) Validate final URL if requested.
 
     Args:
         doi (str): DOI string, or "mddb:<project accession>" for MDDB
@@ -261,6 +318,9 @@ def resolve_download_file_url(
         if validate_uri:
             _validate_url(uri, sleep429, doi, fi_name)
         return uri
+
+    if "dryad" in doi.lower():
+        return resolve_dryad_file_url(doi, fi_name, validate_uri, sleep429)
 
     # Step 1: Resolve DOI to get final URL and domain
     try:
@@ -316,6 +376,73 @@ def resolve_download_file_url(
 
     uri = f"https://{domain}/api/access/datafile/{file_id}"
     if validate_uri:
+        _validate_url(uri, sleep429, doi, fi_name)
+
+    return uri
+
+
+DRYAD_HOST = "https://datadryad.org"
+
+
+def resolve_dryad_file_url(
+        doi: str, fi_name: str, validate_uri: bool = True,
+        sleep429=5) -> str:
+    """
+    :meta private:
+    Resolve a download URL for one file of a Dryad dataset.
+
+    Dryad's dataset/file listing API (/api/v2/datasets, /api/v2/versions/*/files)
+    is open and needs no authentication. Actually fetching file bytes
+    (/api/v2/files/<id>/download) requires a bearer token even for public
+    datasets -- see _dryad_token() for how to provide one (DRYAD_API_TOKEN or
+    DRYAD_CLIENT_ID/DRYAD_CLIENT_SECRET).
+
+    Args:
+        doi (str): Dryad dataset DOI, e.g. "10.5061/dryad.v9s4mw6z2"
+        fi_name (str): name of the file to resolve from source
+        validate_uri (bool, optional): Check if URI exists. Defaults to True.
+        sleep429 (int, optional): Sleep in seconds if 429 HTTP code returned
+
+    Returns:
+        str: file URI
+    """
+    archive_name = fi_name.split('/')[0]
+
+    dataset_uri = f"{DRYAD_HOST}/api/v2/datasets/{quote('doi:' + doi, safe='')}"
+    try:
+        with urllib.request.urlopen(dataset_uri, timeout=10) as response:
+            dataset = json.loads(response.read().decode())
+    except Exception as e:
+        raise RuntimeError(f"Could not fetch Dryad dataset metadata from {dataset_uri}: {e}")
+
+    try:
+        version_href = dataset["_links"]["stash:version"]["href"]
+    except KeyError:
+        raise RuntimeError(f"Unexpected Dryad dataset metadata structure: {dataset}")
+
+    files_uri = f"{DRYAD_HOST}{version_href}/files"
+    entry = None
+    while files_uri and entry is None:
+        try:
+            with urllib.request.urlopen(files_uri, timeout=10) as response:
+                files_page = json.loads(response.read().decode())
+        except Exception as e:
+            raise RuntimeError(f"Could not fetch Dryad file list from {files_uri}: {e}")
+
+        entry = next(
+            (f for f in files_page.get("_embedded", {}).get("stash:files", [])
+             if f.get("path") == archive_name),
+            None,
+        )
+        next_href = files_page.get("_links", {}).get("next", {}).get("href")
+        files_uri = f"{DRYAD_HOST}{next_href}" if next_href else None
+
+    if entry is None:
+        raise FileNotFoundError(f"File '{archive_name}' not found in Dryad dataset DOI {doi}")
+
+    uri = DRYAD_HOST + entry["_links"]["stash:download"]["href"]
+
+    if validate_uri and _dryad_token():
         _validate_url(uri, sleep429, doi, fi_name)
 
     return uri
@@ -394,7 +521,7 @@ def _validate_url(uri, sleep429, doi, fi_name):
     """Helper to validate URL existence and handle 429 rate limits with retry."""
     socket.setdefaulttimeout(10)
     try:
-        urllib.request.urlopen(uri, timeout=10)
+        urllib.request.urlopen(urllib.request.Request(uri, headers=_auth_headers(uri)), timeout=10)
     except TimeoutError:
         raise RuntimeError(f"Cannot open {uri}. Timeout error.")
     except urllib.error.HTTPError as hte:
